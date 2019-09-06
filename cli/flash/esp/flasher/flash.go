@@ -183,11 +183,15 @@ func writeImages(ct esp.ChipType, cfr *cfResult, images []*image, opts *esp.Flas
 	}
 	sort.Sort(imagesByAddr(images))
 
-	if sanityCheck {
-		err = sanityCheckImages(ct, images, cfr.flashParams.Size(), flashSectorSize)
-		if err != nil {
-			return errors.Trace(err)
-		}
+	if opts.FlashOnlyBootloader{
+		images = images[:1]
+	} else if(opts.FlashExceptBootloader){
+		images = images[1:]
+	}
+
+	err = sanityCheckImages(ct, images, cfr.flashParams.Size(), flashSectorSize)
+	if err != nil {
+		return errors.Trace(err)
 	}
 
 	imagesToWrite := images
@@ -266,7 +270,9 @@ func writeImages(ct esp.ChipType, cfr *cfResult, images []*image, opts *esp.Flas
 		expectedDigest := md5.Sum(im.Data)
 		expectedDigestHex := strings.ToLower(hex.EncodeToString(expectedDigest[:]))
 		if digestHex != expectedDigestHex {
-			return errors.Errorf("%d @ 0x%x: digest mismatch: expected %s, got %s", len(im.Data), im.Addr, expectedDigestHex, digestHex)
+			return errors.Errorf("%d @ 0x%x: digest mismatch: expected %s, got %s", len(im.data), im.addr, expectedDigestHex, digestHex)
+		}else{
+			common.Reportf("%d @ 0x%x: digest matched: expected %s, got %s", len(im.data), im.addr, expectedDigestHex, digestHex)
 		}
 	}
 	if opts.BootFirmware {
@@ -306,11 +312,11 @@ func sanityCheckImages(ct esp.ChipType, images []*image, flashSize, flashSectorS
 				imageBegin,
 				flashSectorSize)
 		}
-		if imageBegin == 0 && len(im.Data) > 0 {
-			if im.Data[0] != espImageMagicByte {
-				return errors.Errorf("Invalid magic byte in the first image")
-			}
-		}
+		// if imageBegin == 0 && len(im.data) > 0 {
+		// 	if im.data[0] != espImageMagicByte {
+		// 		return errors.Errorf("Invalid magic byte in the first image")
+		// 	}
+		// }
 		if ct == esp.ChipESP8266 {
 			sysParamsBegin := flashSize - sysParamsAreaSize
 			if imageBegin == sysParamsBegin && im.Type == sysParamsPartType {

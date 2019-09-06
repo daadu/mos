@@ -90,6 +90,8 @@ func init() {
 			"Encryption is only applied to parts with encrypt=true.")
 	flag.Uint32Var(&espFlashOpts.ESP32FlashCryptConf, "esp32-flash-crypt-conf", 0xf,
 		"Value of the FLASH_CRYPT_CONF eFuse setting, affecting how key is tweaked.")
+	flag.BoolVar(&espFlashOpts.FlashOnlyBootloader, "esp32-flash-only-bootloader", false, "Flash only bootloader image (only1st image).")
+	flag.BoolVar(&espFlashOpts.FlashExceptBootloader, "esp32-flash-except-bootloader", false, "Flash all images except bootloader (except 1st image).")
 
 	// RS14100
 	flag.BoolVar(&rs14100FlashOpts.EraseChip, "rs-erase-chip", false, "Erase chip when flashing")
