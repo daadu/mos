@@ -272,9 +272,9 @@ func writeImages(ct esp.ChipType, cfr *cfResult, images []*image, opts *esp.Flas
 		expectedDigest := md5.Sum(im.Data)
 		expectedDigestHex := strings.ToLower(hex.EncodeToString(expectedDigest[:]))
 		if digestHex != expectedDigestHex {
-			return errors.Errorf("%d @ 0x%x: digest mismatch: expected %s, got %s", len(im.Data), im.addr, expectedDigestHex, digestHex)
+			return errors.Errorf("%d @ 0x%x: digest mismatch: expected %s, got %s", len(im.Data), im.Addr, expectedDigestHex, digestHex)
 		}else{
-			common.Reportf("%d @ 0x%x: digest matched: expected %s, got %s", len(im.Data), im.addr, expectedDigestHex, digestHex)
+			common.Reportf("%d @ 0x%x: digest matched: expected %s, got %s", len(im.Data), im.Addr, expectedDigestHex, digestHex)
 		}
 	}
 	if opts.BootFirmware {
