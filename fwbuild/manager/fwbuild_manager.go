@@ -28,7 +28,10 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"os/exec"
 	"path"
+	"sync"
+	"time"
 
 	assetfs "github.com/elazarl/go-bindata-assetfs"
 	"github.com/golang/glog"
@@ -40,6 +43,7 @@ import (
 	fwbuildcommon "github.com/mongoose-os/mos/fwbuild/common"
 	"github.com/mongoose-os/mos/fwbuild/common/reqpar"
 	"github.com/mongoose-os/mos/fwbuild/manager/middleware"
+	"github.com/mongoose-os/mos/version"
 )
 
 var (
@@ -47,17 +51,23 @@ var (
 	mosImage            = flag.String("mos-image", "docker.io/mgos/mos", "Mos tool docker image, without a tag")
 	volumesDir          = flag.String("volumes-dir", "/var/tmp/fwbuild-volumes", "")
 
-	port         = flag.String("port", "80", "HTTP port to listen at.")
-	portTLS      = flag.String("port-tls", "443", "HTTPS port to listen at.")
-	certFile     = flag.String("cert-file", "", "TLS certificate file")
-	keyFile      = flag.String("key-file", "", "TLS key file")
-	payloadLimit = flag.Int64("payload-size-limit", 5*1024*1024, "Max upload size")
+	port              = flag.String("port", "80", "HTTP port to listen at.")
+	portTLS           = flag.String("port-tls", "443", "HTTPS port to listen at.")
+	certFile          = flag.String("cert-file", "", "TLS certificate file")
+	keyFile           = flag.String("key-file", "", "TLS key file")
+	payloadLimit      = flag.Int64("payload-size-limit", 5*1024*1024, "Max upload size")
+	imagePullInterval = flag.Duration("image-pull-interval", 1*time.Hour, "Pull images at this interval")
 
 	errBuildFailure = errors.New("build failure")
+
+	imagePullTimestamp     = map[string]time.Time{}
+	imagePullTimestampLock = sync.Mutex{}
 )
 
 func main() {
 	flag.Parse()
+
+	glog.Infof("fwbuild-manager %s (%s)", version.Version, version.BuildId)
 
 	if err := os.MkdirAll(*volumesDir, 0775); err != nil {
 		glog.Fatal(err)
@@ -146,11 +156,25 @@ func CreateHandler() (http.Handler, error) {
 	return rRoot, nil
 }
 
+func getImageName(version string) string {
+	return fmt.Sprintf("%s:%s", *instanceDockerImage, version)
+}
+
+func doPull(ctx context.Context, version string) error {
+	for _, image := range []string{getImageName(version), fmt.Sprintf("docker.io/mgos/mos:%s", version)} {
+		glog.Infof("Pulling %s...", image)
+		if err := docker.Pull(ctx, image); err != nil {
+			return errors.Annotatef(err, "error pulling %s", image)
+		}
+	}
+	return nil
+}
+
 // runBuild runs fwbuild-instance container with the params reqPar. Returns
 // zip data with the build output files; in case of build failure returned
 // error is errBuildFailure; this can be used to distinguish build failures
 // from other kinds of errors.
-func runBuild(version string, reqPar *reqpar.RequestParams) ([]byte, error) {
+func runBuild(ctx context.Context, version string, reqPar *reqpar.RequestParams) ([]byte, error) {
 	cmdArgs := []string{
 		"--alsologtostderr",
 		"--v", flag.Lookup("v").Value.String(),
@@ -189,25 +213,48 @@ func runBuild(version string, reqPar *reqpar.RequestParams) ([]byte, error) {
 	}()
 	// }}}
 
+	imageName := getImageName(version)
+
+	// Pull the image first, if necessary.
+	if *imagePullInterval != 0 {
+		imagePullTimestampLock.Lock()
+		lastPullTimestamp := imagePullTimestamp[imageName]
+		if time.Now().After(lastPullTimestamp.Add(*imagePullInterval)) {
+			imagePullTimestamp[imageName] = time.Now()
+			imagePullTimestampLock.Unlock()
+			// If this is the first time, make it blocking.
+			// In either case, it's best effort so build does not fail.
+			if lastPullTimestamp.IsZero() {
+				doPull(ctx, version)
+			} else {
+				go doPull(ctx, version)
+			}
+		} else {
+			imagePullTimestampLock.Unlock()
+		}
+	}
+
 	cmdArgs = append(cmdArgs, "--req-params", reqParFile.Name())
 	cmdArgs = append(cmdArgs, "--output-zip", outputFile.Name())
 
 	cmdArgs = append(cmdArgs, "build")
 
-	ctx := context.Background()
-	buildErr := docker.Run(
-		ctx, fmt.Sprintf("%s:%s", *instanceDockerImage, version), os.Stdout,
+	runOpts := []docker.RunOption{
 		// Mgos container should be able to spawn other containers
 		// (read about the "sibling containers" "approach:
 		// https://jpetazzo.github.io/2015/09/03/do-not-use-docker-in-docker-for-ci/)
 		docker.Bind("/var/run/docker.sock", "/var/run/docker.sock", "rw"),
-		// This is no longer necessary post-2.6 but is preserved for backward compatibility.
-		docker.Bind("/usr/bin/docker", "/usr/bin/docker", "ro"),
-
+	}
+	// This is no longer necessary post-2.6 but is preserved for backward compatibility.
+	if dockerBin, err := exec.LookPath("docker"); err == nil {
+		runOpts = append(runOpts, docker.Bind(dockerBin, "/usr/bin/docker", "ro"))
+	}
+	runOpts = append(runOpts,
 		docker.Bind(*volumesDir, *volumesDir, "rw"),
-
 		docker.Cmd(cmdArgs),
 	)
+
+	buildErr := docker.Run(ctx, imageName, os.Stdout, runOpts...)
 
 	// Read zip data from output file
 	data, err := ioutil.ReadAll(outputFile)
@@ -226,7 +273,11 @@ func runBuild(version string, reqPar *reqpar.RequestParams) ([]byte, error) {
 	return data, nil
 }
 
-func handleFwbuildAction2(w http.ResponseWriter, r *http.Request, version, action string) {
+func handleFwbuildAction(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	version := pat.Param(r, "version")
+	action := pat.Param(r, "action")
+
 	switch action {
 	case "build":
 		// Get request params to be saved to a json file
@@ -234,7 +285,7 @@ func handleFwbuildAction2(w http.ResponseWriter, r *http.Request, version, actio
 		if err != nil {
 			glog.Infof("Request error: %s", err)
 			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte(err.Error()))
+			w.Write([]byte(err.Error() + "\n"))
 			return
 		}
 
@@ -243,7 +294,7 @@ func handleFwbuildAction2(w http.ResponseWriter, r *http.Request, version, actio
 		}()
 
 		// Perform the build
-		data, err := runBuild(version, reqPar)
+		data, err := runBuild(ctx, version, reqPar)
 		if err != nil {
 			if errors.Cause(err) == errBuildFailure {
 				w.WriteHeader(http.StatusTeapot)
@@ -256,17 +307,19 @@ func handleFwbuildAction2(w http.ResponseWriter, r *http.Request, version, actio
 
 		w.Write(data)
 
+	case "pull":
+		if err := doPull(ctx, version); err != nil {
+			glog.Infof("Request error: %s", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(err.Error() + "\n"))
+			return
+		}
+		w.Write([]byte("Ok\n"))
+
 	default:
 		err := errors.Errorf("wrong action: %q", action)
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte(err.Error()))
 		return
 	}
-}
-
-func handleFwbuildAction(w http.ResponseWriter, r *http.Request) {
-	version := pat.Param(r, "version")
-	action := pat.Param(r, "action")
-
-	handleFwbuildAction2(w, r, version, action)
 }

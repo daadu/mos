@@ -26,7 +26,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/golang/glog"
 	"github.com/juju/errors"
@@ -158,11 +157,11 @@ func GCPIoTSetup(ctx context.Context, devConn dev.DevConn) error {
 	}
 	resp, err := iotAPIClient.Projects.Locations.Registries.Devices.Create(parent, &device).Do()
 	if err != nil {
-		glog.Infof("Error creating device: %s %#v", err, resp)
+		glog.Errorf("Error creating device: %s %#v", err, resp)
 		ourutil.Reportf("Trying to delete the device...")
 		dev := fmt.Sprintf("%s/devices/%s", parent, devID)
-		_, err = iotAPIClient.Projects.Locations.Registries.Devices.Delete(dev).Do()
-		if err != nil {
+		_, err1 := iotAPIClient.Projects.Locations.Registries.Devices.Delete(dev).Do()
+		if err1 != nil {
 			return errors.Annotatef(err, "failed to re-create device")
 		}
 		ourutil.Reportf("Retrying device creation...")
@@ -172,40 +171,40 @@ func GCPIoTSetup(ctx context.Context, devConn dev.DevConn) error {
 		}
 	}
 
-	// ca.pem has both roots in it, so, for platforms other than CC32XX, we can just use that.
-	// CC32XX do not support cert bundles and will always require specific CA cert.
-	// http://e2e.ti.com/support/wireless_connectivity/simplelink_wifi_cc31xx_cc32xx/f/968/t/634431
-	caCertFile := "ca.pem"
-	uploadCACert := false
-	if strings.HasPrefix(strings.ToLower(*devInfo.Arch), "cc320") {
-		caCertFile = "data/ca-globalsign.crt.pem"
-		uploadCACert = true
+	caCertFile := "data/gcp-lts-ca.pem"
+	caCertData := MustAsset(caCertFile)
+	ourutil.Reportf("Uploading CA certificate...")
+	err = fs.PutData(ctx, devConn, bytes.NewBuffer(caCertData), filepath.Base(caCertFile))
+	if err != nil {
+		return errors.Annotatef(err, "failed to upload %s", filepath.Base(caCertFile))
 	}
-
-	if uploadCACert {
-		caCertData := MustAsset(caCertFile)
-		ourutil.Reportf("Uploading CA certificate...")
-		err = fs.PutData(ctx, devConn, bytes.NewBuffer(caCertData), filepath.Base(caCertFile))
-		if err != nil {
-			return errors.Annotatef(err, "failed to upload %s", filepath.Base(caCertFile))
-		}
-	}
-
-	// GCP does not support bi-di MQTT comms, RPC won't work.
-	// Turn off if it's present, don't fail if it isn't.
-	devConf.Set("rpc.mqtt.enable", "false")
 
 	newConf := map[string]string{
-		"sntp.enable":      "true",
-		"mqtt.enable":      "true",
-		"mqtt.server":      "mqtt.googleapis.com:8883",
-		"mqtt.ssl_ca_cert": filepath.Base(caCertFile),
-		"gcp.enable":       "true",
-		"gcp.project":      *flags.GCPProject,
-		"gcp.region":       *flags.GCPRegion,
-		"gcp.registry":     *flags.GCPRegistry,
-		"gcp.device":       devID,
-		"gcp.key":          keyDevFileName,
+		"gcp.enable":   "true",
+		"gcp.project":  *flags.GCPProject,
+		"gcp.region":   *flags.GCPRegion,
+		"gcp.registry": *flags.GCPRegistry,
+		"gcp.device":   devID,
+		"gcp.key":      keyDevFileName,
+		"gcp.server":   "mqtt.2030.ltsapis.goog:8883",
+	}
+	// GCP tokens require valid wall time, enable SNTP if available.
+	if _, err := devConf.Get("sntp.enable"); err == nil {
+		newConf["sntp.enable"] = "true"
+	}
+	if _, err := devConf.Get("rpc.mqtt.enable"); err == nil {
+		// GCP does not support bi-di MQTT comms, RPC won't work.
+		// Turn off if it's present, don't fail if it isn't.
+		newConf["rpc.mqtt.enable"] = "false"
+	}
+
+	if _, err := devConf.Get("gcp.ca_cert"); err == nil {
+		// Modern GCP library.
+		newConf["gcp.ca_cert"] = filepath.Base(caCertFile)
+	} else {
+		// Legacy: need to enable MQTT separately.
+		newConf["mqtt.ssl_ca_cert"] = filepath.Base(caCertFile)
+		newConf["mqtt.enable"] = "true"
 	}
 	if err := config.ApplyDiff(devConf, newConf); err != nil {
 		return errors.Trace(err)

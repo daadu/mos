@@ -61,8 +61,10 @@ const (
 	// - 2018-09-24: added special handling of the "boards" lib
 	// - 2019-04-26: added warning and error
 	// - 2019-07-28: added init_before
+	// - 2020-01-21: added ability to override lib variants from conds in app manifest
+	// - 2020-01-29: added ability to override app name, description and version from app's conds
 	minManifestVersion = "2017-03-17"
-	maxManifestVersion = "2019-07-28"
+	maxManifestVersion = "2020-01-29"
 
 	depsApp = "app"
 
@@ -307,7 +309,7 @@ func ReadManifestFinal(
 					if err == nil {
 						// Local file exists, check it.
 						// We want to re-fetch "latest" libs regularly (same way as repos get pulled).
-						if variant != version.LatestVersionName || binaryLibsUpdateInterval == 0 ||
+						if libVersion != version.LatestVersionName || binaryLibsUpdateInterval == 0 ||
 							fi.ModTime().Add(binaryLibsUpdateInterval).After(time.Now()) {
 							if fi.Size() == 0 {
 								// It's a tombstone, meaning this variant does not exist. Skip it.
@@ -404,7 +406,7 @@ type manifestParseContext struct {
 
 	deps        *Deps
 	initDeps    *Deps
-	libsHandled map[string]build.FWAppManifestLibHandled
+	libsHandled map[string]*build.FWAppManifestLibHandled
 
 	appManifest *build.FWAppManifest
 	interp      *interpreter.MosInterpreter
@@ -430,7 +432,7 @@ func readManifestWithLibs(
 	requireArch bool,
 ) (*build.FWAppManifest, time.Time, error) {
 	interp = interp.Copy()
-	libsHandled := map[string]build.FWAppManifestLibHandled{}
+	libsHandled := map[string]*build.FWAppManifestLibHandled{}
 
 	// Create a deps structure and add a root node: an "app"
 	deps := NewDeps()
@@ -504,7 +506,7 @@ func readManifestWithLibs(
 
 		lhp := map[string]*build.FWAppManifestLibHandled{}
 		for k, v := range libsHandled {
-			vc := v
+			vc := *v
 			lhp[k] = &vc
 		}
 
@@ -635,6 +637,7 @@ func readManifestWithLibs2(parentNodeName, dir string, pc *manifestParseContext)
 		if !manifest.NoImplInitDeps {
 			found := false
 			for _, l := range manifest.Libs {
+				l.Normalize()
 				if name, _ := l.GetName(); name == coreLibName {
 					found = true
 					break
@@ -648,7 +651,19 @@ func readManifestWithLibs2(parentNodeName, dir string, pc *manifestParseContext)
 		}
 
 		for _, l := range pc.adjustments.ExtraLibs {
-			manifest.Libs = append(manifest.Libs, l)
+			l.Normalize()
+			lName, _ := l.GetName()
+			found := false
+			for _, al := range manifest.Libs {
+				al.Normalize()
+				if name, _ := al.GetName(); name == lName {
+					found = true
+					break
+				}
+			}
+			if !found {
+				manifest.Libs = append(manifest.Libs, l)
+			}
 		}
 		pc.adjustments.ExtraLibs = nil
 
@@ -740,12 +755,25 @@ func prepareLib(
 	if !manifest.NoImplInitDeps {
 		pc.initDeps.AddDep(parentNodeName, name) // Implicit init dep
 	}
-	pc.mtx.Unlock()
 
 	if !pc.flagSet.Add(name) {
-		// That library is already handled by someone else
+		if pc.libsHandled[name] != nil {
+			// That library is already handled by someone else
+			// App manifest can override library variants (in conds).
+			lm := &pc.libsHandled[name].Lib
+			if m.Variant != "" && parentNodeName == depsApp {
+				glog.V(1).Infof("%s variant: %q -> %q", name, lm.Variant, m.Variant)
+				lm.Variant = m.Variant
+			}
+		} else {
+			lpres <- libPrepareResult{
+				err: fmt.Errorf("duplicate library %q in %s", name, manifest.Origin),
+			}
+		}
+		pc.mtx.Unlock()
 		return
 	}
+	pc.mtx.Unlock()
 
 	ourutil.Freportf(pc.logWriter, "Handling lib %q...", name)
 
@@ -796,7 +824,7 @@ func prepareLib(
 	manifest.BuildVars[haveName] = "1"
 	manifest.CDefs[haveName] = "1"
 
-	lh := build.FWAppManifestLibHandled{
+	lh := &build.FWAppManifestLibHandled{
 		Lib:      *m,
 		Path:     libLocalDir,
 		Deps:     pc.deps.GetDeps(name),
@@ -1053,7 +1081,7 @@ func expandManifestLibsAndConds(
 	//
 	// TODO(dfrank): probably make it so that if conds expression fails to
 	// evaluate, keep it unexpanded for now.
-	if err := ExpandManifestConds(rootManifest, rootManifest, interp); err != nil {
+	if err := ExpandManifestConds(rootManifest, rootManifest, interp, false); err != nil {
 		return errors.Trace(err)
 	}
 
@@ -1142,7 +1170,7 @@ func expandManifestLibsAndConds(
 		// top-level (app) conds are evaluated first, and then evaluation proceeds
 		// from the bottom (starting with libs with no deps).
 
-		if err := ExpandManifestConds(manifest, commonManifest, interp); err != nil {
+		if err := ExpandManifestConds(manifest, commonManifest, interp, true); err != nil {
 			return errors.Annotatef(err, "expanding app manifest's conds")
 		}
 		if len(manifest.Libs) > 0 {
@@ -1152,7 +1180,7 @@ func expandManifestLibsAndConds(
 
 		for _, l := range manifest.LibsHandled {
 			if l.Manifest != nil && len(l.Manifest.Conds) > 0 {
-				if err := ExpandManifestConds(l.Manifest, commonManifest, interp); err != nil {
+				if err := ExpandManifestConds(l.Manifest, commonManifest, interp, false); err != nil {
 					return errors.Annotatef(err, "expanding %q conds", l.Lib.Name)
 				}
 				if len(l.Manifest.Libs) > 0 {
@@ -1224,7 +1252,7 @@ func expandAllLibsPaths(
 // `${build_vars.FOO} bar`) are expanded against dstManifest. See README.md,
 // Step 3 for details.
 func ExpandManifestConds(
-	dstManifest, refManifest *build.FWAppManifest, interp *interpreter.MosInterpreter,
+	dstManifest, refManifest *build.FWAppManifest, interp *interpreter.MosInterpreter, isAppManifest bool,
 ) error {
 	interp = interp.Copy()
 
@@ -1264,6 +1292,18 @@ func ExpandManifestConds(
 				skipFailedExpansions: true,
 			}); err != nil {
 				return errors.Trace(err)
+			}
+			// Conds in app's manifest can override name, description and version.
+			if isAppManifest {
+				if cond.Apply.Name != "" {
+					dstManifest.Name = cond.Apply.Name
+				}
+				if cond.Apply.Description != "" {
+					dstManifest.Description = cond.Apply.Description
+				}
+				if cond.Apply.Version != "" {
+					dstManifest.Version = cond.Apply.Version
+				}
 			}
 		}
 	}
